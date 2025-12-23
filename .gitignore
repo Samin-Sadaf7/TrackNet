@@ -1,0 +1,9 @@
+TrackNetV2/
+TrackNetV2.zip
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.vscode/
+.env

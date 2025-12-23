@@ -1,0 +1,9 @@
+# Project dependencies
+# Add required packages here, for example:
+# numpy==1.26.0
+# requests>=2.31.0
+opencv-python 
+numpy
+shapely
+pandas
+scipy
