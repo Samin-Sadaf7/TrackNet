@@ -3,9 +3,9 @@ import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
 
-CSV = "TrackNetV2/Professional/match16/csv/2_08_08_ball.csv"
-VIDEO = "TrackNetV2/Professional/match16/video/2_08_08.mp4"
-OUTPUT = f"hawkeye_ground_{VIDEO[38:]}.png"
+CSV = "TrackNetV2/Professional/match16/csv/1_13_20_ball.csv"
+VIDEO = "TrackNetV2/Professional/match16/video/1_13_20.mp4"
+OUTPUT = "hawkeye_full_court_shadow.png"
 
 # ----------------- 1. LOAD DATA -----------------
 df = pd.read_csv(CSV)
@@ -51,124 +51,90 @@ def detect_ground_impact(frames, xs, ys):
 
 impact = detect_ground_impact(frames, xs, ys)
 
-# ----------------- 3. LOAD IMPACT FRAME -----------------
+# ----------------- 3. COURT SCALED DIMENSIONS -----------------
+COURT_LENGTH = 13.41   # 44 ft
+COURT_WIDTH = 6.10     # 20 ft doubles
+SINGLES_WIDTH = 5.18   # 17 ft singles
+SHORT_SERVICE_LINE_DIST = 1.98
+PIXELS_PER_METER = 80
+TOP_H = int(COURT_LENGTH * PIXELS_PER_METER) + 100
+TOP_W = int(COURT_WIDTH * PIXELS_PER_METER)*2 + 150
+OFFSET_X = 50
+OFFSET_Y = 50
+
+result = np.zeros((TOP_H, TOP_W, 3), dtype=np.uint8)
+
+# ----------------- 4. CONVERSION -----------------
+def to_pixels(x_m, y_m, offset_x=OFFSET_X, offset_y=OFFSET_Y):
+    return (int(x_m*PIXELS_PER_METER)+offset_x, int(y_m*PIXELS_PER_METER)+offset_y)
+
+# ----------------- 5. DRAW COURTS -----------------
+def draw_court(start_x, start_y, doubles=True):
+    court_w = COURT_WIDTH if doubles else SINGLES_WIDTH
+    color_outer = (255,255,255) if doubles else (0,255,255)
+    thickness_outer = 3 if doubles else 2
+    color_inner = (180,180,180)
+    
+    outer_pts = np.array([
+        to_pixels(0,0,start_x,start_y),
+        to_pixels(court_w,0,start_x,start_y),
+        to_pixels(court_w,COURT_LENGTH,start_x,start_y),
+        to_pixels(0,COURT_LENGTH,start_x,start_y)
+    ], np.int32)
+    cv2.polylines(result,[outer_pts],True,color_outer,thickness_outer)
+    
+    # Net
+    cv2.line(result, to_pixels(0,COURT_LENGTH/2,start_x,start_y),
+             to_pixels(court_w,COURT_LENGTH/2,start_x,start_y), color_inner,2)
+    
+    # Short service lines
+    cv2.line(result, to_pixels(0,SHORT_SERVICE_LINE_DIST,start_x,start_y),
+             to_pixels(court_w,SHORT_SERVICE_LINE_DIST,start_x,start_y), color_inner,2)
+    cv2.line(result, to_pixels(0,COURT_LENGTH-SHORT_SERVICE_LINE_DIST,start_x,start_y),
+             to_pixels(court_w,COURT_LENGTH-SHORT_SERVICE_LINE_DIST,start_x,start_y), color_inner,2)
+    
+    # Center line
+    cv2.line(result, to_pixels(court_w/2,SHORT_SERVICE_LINE_DIST,start_x,start_y),
+             to_pixels(court_w/2,COURT_LENGTH-SHORT_SERVICE_LINE_DIST,start_x,start_y), color_inner,2)
+    
+    return outer_pts
+
+doubles_polygon = draw_court(OFFSET_X, OFFSET_Y, doubles=True)
+singles_polygon = draw_court(TOP_W//2 + 25, OFFSET_Y, doubles=False)
+
+# ----------------- 6. LOAD VIDEO IMPACT FRAME -----------------
 cap = cv2.VideoCapture(VIDEO)
 cap.set(cv2.CAP_PROP_POS_FRAMES, impact["frame"])
 ret, frame = cap.read()
 cap.release()
 if not ret:
     raise RuntimeError(f"Cannot read impact frame {impact['frame']}")
-gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-# ----------------- 4. DETECT COURT LINES (ROTATED) -----------------
-hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-v_channel = hsv[:,:,2]
-blur = cv2.GaussianBlur(v_channel,(5,5),0)
-edges = cv2.Canny(blur,30,120,apertureSize=3)
-lines = cv2.HoughLinesP(edges,1,np.pi/180,threshold=50,minLineLength=50,maxLineGap=20)
+# Map shuttle drop point from video to court (doubles)
+impact_x = np.interp(impact["x"], [0, W], [0, COURT_WIDTH])
+impact_y = np.interp(impact["y_ground"], [0, H], [0, COURT_LENGTH])
+impact_point = to_pixels(impact_x, impact_y, OFFSET_X, OFFSET_Y)
 
-# store candidate lines with their angle
-candidate_lines = []
-if lines is not None:
-    for x1,y1,x2,y2 in lines[:,0]:
-        angle = np.arctan2((y2-y1),(x2-x1))  # in radians
-        length = np.sqrt((x2-x1)**2 + (y2-y1)**2)
-        if length > 50:  # ignore tiny lines
-            candidate_lines.append((x1,y1,x2,y2,angle))
+# ----------------- 7. DRAW SHADOW EFFECT -----------------
+shadow = np.zeros_like(result, dtype=np.uint8)
+cv2.circle(shadow, impact_point, 25, (60,60,60), -1)  # shadow larger
+cv2.circle(shadow, impact_point, 15, (120,120,120), -1) # inner darker
+shadow = cv2.GaussianBlur(shadow, (101,101), 40)
+result = cv2.addWeighted(result,1.0,shadow,0.7,0)
 
-if not candidate_lines:
-    raise RuntimeError("No candidate lines detected")
-
-# ----------------- 4b. CLUSTER LINES INTO HORIZONTAL/VERTICAL -----------------
-# dominant horizontal: around 0 or pi
-h_lines = [l[:4] for l in candidate_lines if abs(np.sin(l[4])) < 0.2]
-# dominant vertical: around pi/2
-v_lines = [l[:4] for l in candidate_lines if abs(np.cos(l[4])) < 0.2]
-
-def select_extreme_lines(lines, axis=1):
-    """Pick top/bottom for horizontal (axis=1), left/right for vertical (axis=0)"""
-    if not lines:
-        return None, None
-    coords = np.array([ (l[axis]+l[axis+2])/2 for l in lines ])
-    min_line = lines[np.argmin(coords)]
-    max_line = lines[np.argmax(coords)]
-    return min_line, max_line
-
-top_line, bottom_line = select_extreme_lines(h_lines, axis=1)
-left_line, right_line = select_extreme_lines(v_lines, axis=0)
-
-if None in [top_line,bottom_line,left_line,right_line]:
-    raise RuntimeError("Court horizontal/vertical lines not detected")
-
-court_polygon = np.array([
-    [left_line[0],top_line[1]],
-    [right_line[0],top_line[1]],
-    [right_line[0],bottom_line[1]],
-    [left_line[0],bottom_line[1]]
-])
-
-# ----------------- 5. IN/OUT VERDICT -----------------
-impact_point = (impact["x"],impact["y_ground"])
-inside = cv2.pointPolygonTest(court_polygon,impact_point,False)>=0
-verdict = "IN" if inside else "OUT"
+# ----------------- 8. DRAW IMPACT POINT -----------------
+inside = cv2.pointPolygonTest(doubles_polygon, impact_point, False) >= 0
 color = (0,255,0) if inside else (0,0,255)
+cv2.circle(result, impact_point, 12, color, -1)
+cv2.circle(result, impact_point, 20, color, 2)
 
-# ----------------- 6. DRAW COURT AND IMPACT -----------------
-result = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+# ----------------- 9. VERDICT -----------------
+verdict = "IN" if inside else "OUT"
+cv2.putText(result, f"VERDICT: {verdict}", (20,40), cv2.FONT_HERSHEY_DUPLEX, 1.5, color,3)
+cv2.putText(result, "HAWK-EYE TOP VIEW", (20,90), cv2.FONT_HERSHEY_SIMPLEX,1.2,(255,255,255),2)
 
-# draw court lines
-for l in [top_line,bottom_line,left_line,right_line]:
-    x1,y1,x2,y2 = l
-    cv2.line(result,(x1,y1),(x2,y2),(255,255,255),2)
-
-# ----------------- 6b. PROJECTION LINES OUTSIDE COURT -----------------
-def project_line_outside(polygon, impact_point, direction='vertical'):
-    """Return a point outside the court polygon along given direction."""
-    x, y = impact_point
-    xs = polygon[:,0]
-    ys = polygon[:,1]
-
-    if direction == 'vertical':
-        top_y = min(ys)
-        bottom_y = max(ys)
-        if abs(y - top_y) < abs(y - bottom_y):
-            return (x, top_y - 20)  # 20 pixels outside
-        else:
-            return (x, bottom_y + 20)
-    else:  # horizontal
-        left_x = min(xs)
-        right_x = max(xs)
-        if abs(x - left_x) < abs(x - right_x):
-            return (left_x - 20, y)
-        else:
-            return (right_x + 20, y)
-
-# draw projection lines from outside the court
-vert_start = project_line_outside(court_polygon, impact_point, 'vertical')
-hor_start = project_line_outside(court_polygon, impact_point, 'horizontal')
-cv2.line(result, vert_start, impact_point, color, 2)
-cv2.line(result, hor_start, impact_point, color, 2)
-
-# impact shadow
-shadow = np.zeros_like(result,dtype=np.float32)
-cv2.circle(shadow,impact_point,85,(120,120,120),-1)
-cv2.circle(shadow,impact_point,40,(180,180,180),-1)
-shadow = cv2.GaussianBlur(shadow,(101,101),60)
-result = cv2.addWeighted(result,1.0,shadow.astype(np.uint8),0.9,0)
-
-# impact marker
-cv2.circle(result,impact_point,7,color,-1)
-cv2.circle(result,impact_point,18,color,2)
-
-# verdict text
-cv2.putText(result,f"VERDICT: {verdict}",(40,60),cv2.FONT_HERSHEY_DUPLEX,1.6,color,3)
-cv2.putText(result,"HAWK-EYE LINE CALL",(40,110),cv2.FONT_HERSHEY_SIMPLEX,1.0,(255,255,255),2)
-
-cv2.imwrite(OUTPUT,result)
-
-print("\n==============================")
-print("IMPACT FRAME:",impact["frame"])
-print("IMPACT POINT:",impact_point)
-print("VERDICT:",verdict)
-print("OUTPUT:",OUTPUT)
-print("==============================\n")
+# ----------------- 10. SAVE -----------------
+cv2.imwrite(OUTPUT, result)
+print("OUTPUT saved:", OUTPUT)
+print("Impact Point:", impact_point)
+print("VERDICT:", verdict)
