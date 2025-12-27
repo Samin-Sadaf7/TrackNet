@@ -29,51 +29,82 @@ def detect_game_type(video_path, sample_frames=20):
     return np.median(counts) >= 3.5 if counts else True
 
 # =========================================================
-# 2. ENHANCED SHUTTLE TRACKING
+# 2. ENHANCED SHUTTLE TRACKING WITH KALMAN FILTER
 # =========================================================
-def detect_shuttle_in_frame(frame, fg, last=None):
-    H, W = frame.shape[:2]
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    value = hsv[:,:,2]
-    mask_white = cv2.inRange(value, 180, 255)
-    mask = cv2.bitwise_and(fg, mask_white)
-    mask[int(H*0.8):,:] = 0
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,kernel)
-    contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best, score_best = None, 0
-    for c in contours:
-        area = cv2.contourArea(c)
-        if not 10<area<600:
-            continue
-        x,y,w,h = cv2.boundingRect(c)
-        cx,cy = x+w//2, y+h//2
-        score = 0
-        if 20<area<300: score+=3
-        ratio = w/h if h>0 else 0
-        if 0.6<ratio<1.8: score+=2
-        if last and np.linalg.norm([cx-last[0], cy-last[1]])<120: score+=2
-        if H*0.3<cy<H*0.8: score+=1
-        if score>score_best:
-            best, score_best = (cx,cy), score
-    return best if score_best>=5 else None
+class ShuttleTracker:
+    def __init__(self):
+        # Kalman filter setup
+        self.kalman = cv2.KalmanFilter(4,2)
+        self.kalman.measurementMatrix = np.array([[1,0,0,0],
+                                                  [0,1,0,0]],np.float32)
+        self.kalman.transitionMatrix = np.array([[1,0,1,0],
+                                                 [0,1,0,1],
+                                                 [0,0,1,0],
+                                                 [0,0,0,1]],np.float32)
+        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32)*0.03
+        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32)*0.5
+        self.last_pos = None
+
+    def detect_in_frame(self, frame, fg):
+        H, W = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        value = hsv[:,:,2]
+        mask_white = cv2.inRange(value, 190, 255)  # higher threshold for shuttle
+        mask = cv2.bitwise_and(fg, mask_white)
+        mask[int(H*0.8):,:] = 0  # ignore lower area
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,kernel)
+        contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best, score_best = None, 0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if not 5<area<500:
+                continue
+            x,y,w,h = cv2.boundingRect(c)
+            cx,cy = x+w//2, y+h//2
+            score = 0
+            # area scoring
+            if 10<area<200: score+=3
+            elif 200<=area<400: score+=2
+            # aspect ratio
+            ratio = w/h if h>0 else 0
+            if 0.5<ratio<1.8: score+=2
+            # proximity to last position
+            if self.last_pos and np.linalg.norm([cx-self.last_pos[0], cy-self.last_pos[1]])<120:
+                score+=3
+            # position preference (middle court)
+            if H*0.3<cy<H*0.8: score+=1
+            if score>score_best:
+                best, score_best = (cx,cy), score
+
+        # Kalman prediction
+        prediction = self.kalman.predict()
+        if best:
+            measurement = np.array([[np.float32(best[0])],
+                                    [np.float32(best[1])]])
+            self.kalman.correct(measurement)
+            self.last_pos = best
+        else:
+            # fallback to prediction
+            best = (int(prediction[0]), int(prediction[1]))
+        return best if score_best>=4 else None
 
 def detect_trajectory(video):
     cap = cv2.VideoCapture(video)
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    bg = cv2.createBackgroundSubtractorMOG2(300,25,False)
-    traj,last=[],None
-    f=0
+    bg = cv2.createBackgroundSubtractorMOG2(500,16,False)
+    tracker = ShuttleTracker()
+    traj, f = [], 0
     while True:
         ret,frame=cap.read()
         if not ret: break
         fg=bg.apply(frame)
-        pos = detect_shuttle_in_frame(frame,fg,last)
+        pos = tracker.detect_in_frame(frame, fg)
         if pos:
             traj.append({"frame":f,"x":pos[0],"y":pos[1]})
-            last=pos
         f+=1
     cap.release()
     return traj,H,W
@@ -143,35 +174,23 @@ def px(x,y):
 
 def draw_full_badminton_court():
     court = np.zeros((TOP_H,TOP_W,3),np.uint8)
-    # Outer boundary
     cv2.rectangle(court,px(0,0),px(COURT_W,COURT_L),(255,255,255),3)
-    # Net
     cv2.line(court,px(0,NET_Y),px(COURT_W,NET_Y),(150,150,150),3)
-    # Center line for doubles
     cv2.line(court, px(COURT_W/2,0), px(COURT_W/2,COURT_L), (150,150,150),2)
-    # Short service line
     SSL = 1.98
     cv2.line(court, px(0,SSL), px(COURT_W,SSL),(0,255,0),2)
     cv2.line(court, px(0,COURT_L-SSL), px(COURT_W,COURT_L-SSL),(0,255,0),2)
-    # Long service line for doubles
     LSL = 0.76
     cv2.line(court, px(0,LSL), px(COURT_W,LSL),(0,255,0),1)
     cv2.line(court, px(0,COURT_L-LSL), px(COURT_W,COURT_L-LSL),(0,255,0),1)
-    # Singles side lines
     SSW = 5.18
     cv2.line(court, px(0,0), px(0,COURT_L),(0,200,0),2)
     cv2.line(court, px(COURT_W,0), px(COURT_W,COURT_L),(0,200,0),2)
-    # Doubles side lines
-    DSW = 6.10
-    # Already outer boundary
-    # Scale markers (1-10 meters)
     for m in range(1,11):
-        # horizontal (length)
         x1,y1=px(0,m*COURT_L/10)
         x2,y2=px(COURT_W,m*COURT_L/10)
         cv2.line(court,(x1,y1),(x2,y2),(0,200,0),1)
         cv2.putText(court,str(m),(3,y1-3),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,200,0),1)
-        # vertical (width)
         x1,y1=px(m*COURT_W/10,0)
         x2,y2=px(m*COURT_W/10,COURT_L)
         cv2.line(court,(x1,y1),(x2,y2),(0,200,0),1)
@@ -194,23 +213,19 @@ cap.set(cv2.CAP_PROP_POS_FRAMES,impact['frame'])
 _,frame=cap.read()
 cap.release()
 
-# Side line calibration
 left,right=detect_side_lines(frame)
 px_width=abs(right[0]-left[0])
 meters_per_pixel=COURT_W/px_width
 
-# Accurate impact mapping
 x_m=(impact['x']-left[0])*meters_per_pixel
 y_m=impact['y']/Hc*COURT_L
 x_m=np.clip(x_m,0,COURT_W)
 y_m=np.clip(y_m,0,COURT_L)
 impact_px=px(x_m,y_m)
 
-# Camera view
 camera_view=draw_camera_trajectory(frame,traj,impact)
 cv2.imwrite(OUT_CAMERA,camera_view)
 
-# Top court view
 court,poly=draw_full_badminton_court()
 inside=cv2.pointPolygonTest(poly,impact_px,False)>=0
 color=(0,255,0) if inside else (0,0,255)
@@ -219,7 +234,6 @@ cv2.circle(court,impact_px,12,color,-1)
 cv2.putText(court,"IN" if inside else "OUT",(30,50),cv2.FONT_HERSHEY_DUPLEX,1.6,color,3)
 cv2.imwrite(OUT_COURT,court)
 
-# Zoomed view
 z=120
 x1,y1=max(0,impact_px[0]-z),max(0,impact_px[1]-z)
 x2,y2=min(TOP_W,impact_px[0]+z),min(TOP_H,impact_px[1]+z)
